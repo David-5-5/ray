@@ -886,8 +886,9 @@ def test_mutually_recursive_functions(ray_start_shared_local_modes):
     assert ray.get(factorial_even.remote(4)) == 24
     assert ray.get(factorial_odd.remote(5)) == 120
 
-
-def test_ray_recursive_objects(ray_start_shared_local_modes):
+# test_ray_recursive_objects has two mode:
+# params=[{"local_mode": True}, {"local_mode": False}]
+def test_ray_recursive_objects(test_ray_recursive_objects):
     class ClassA:
         pass
 
