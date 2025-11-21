@@ -233,7 +233,7 @@ def test_default_worker_import_dependency(shutdown_only):
 
     ray.get(f.remote())
 
-
+# only support linux
 @pytest.mark.skipif(
     sys.platform != "linux", reason="Windows/OSX thread count not policed yet."
 )
@@ -247,8 +247,8 @@ def test_worker_thread_count(monkeypatch, shutdown_only):
     @ray.remote
     class Actor:
         def get_thread_count(self):
-            try:
-                process = psutil.Process(os.getpid())
+            try:  # compatbile without psutil
+                process = psutil.Process(os.getpid())   # current thread of worker
                 return process.num_threads()
             except ImportError:
                 return None
