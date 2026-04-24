@@ -21,23 +21,19 @@ Higher-level AI libraries:
 
 ## Architecture
 
-### Core System Components
+### Core System Layers
 
 Ray has a layered architecture:
 
 1. **C++ Core (`src/ray/`)**:
-   - **Raylet**: The node manager that runs on each machine. Responsible for task scheduling, worker management, and object management.
-     - `src/ray/raylet/` - Main raylet implementation
-     - Scheduling logic, worker pool management, IPC
+   - **Raylet**: Node manager running on each machine - responsible for task scheduling, worker management, object management
+     - `src/ray/raylet/` - Main raylet implementation, scheduling logic, worker pool, IPC
    - **Core Worker**: Per-process execution engine for tasks and actors
-     - `src/ray/core_worker/` - Core worker implementation
-     - Task submission, actor management, object references
+     - `src/ray/core_worker/` - Task submission, actor management, object references
    - **GCS (Global Control Store)**: Centralized state management
-     - `src/ray/gcs/` - Redis-backed global state storage
-     - Actor/task/job table management, pub/sub
+     - `src/ray/gcs/` - Redis-backed global state storage, actor/task/job tables, pub/sub
    - **Object Manager**: Distributed object store
-     - `src/ray/object_manager/` - Plasma object store integration
-     - Object transfer between nodes
+     - `src/ray/object_manager/` - Plasma object store, object transfer between nodes
 
 2. **Python API (`python/ray/`)**:
    - `python/ray/actor.py` - Actor API and management
@@ -57,6 +53,12 @@ Ray has a layered architecture:
 4. Raylet schedules work on workers based on resources and locality
 5. Objects stored in Plasma object store, accessible via reference counting
 
+### Code Analysis Reference
+
+Detailed execution flow analysis stored in `ray-code-analysis/`:
+- `start-head-flow.md` - `ray start --head` complete execution flow from Python to C++
+- `remote-execution-flow.md` - `@ray.remote` decorator task submission flow
+
 ## Directory Structure
 
 - `src/ray/`: C++ core distributed runtime (raylet, object manager, GCS, scheduling, RPC, etc.)
@@ -75,16 +77,34 @@ Ray has a layered architecture:
 
 ## Build Commands
 
-### Install development version
+### Python-only Development (Fastest)
 ```bash
-# Install Ray in development mode
-pip install -e "python[all]" -c python/requirements_compiled.txt
-
-# Skip C++ compilation (faster build for Python-only changes)
-RAY_DISABLE_EXTRA_CPP=1 pip install -e "python[all]"
+# Skip C++ compilation - recommended for Python-only changes
+python python/ray/setup-dev.py -y
 ```
 
-### Build with Bazel
+### Full Build with pip
+```bash
+cd python
+pip install -e . --verbose
+
+# Debug build
+RAY_DEBUG_BUILD=debug pip install -e . --verbose
+```
+
+### Environment Variables to Skip Compilation
+```bash
+# Disable extra C++ compilation (speeds up Python development)
+export RAY_DISABLE_EXTRA_CPP=1
+
+# Skip building core
+export RAY_BUILD_CORE=0
+
+# Skip Bazel build step
+export SKIP_BAZEL_BUILD=1
+```
+
+### Bazel Build (for C++ development)
 ```bash
 # Full build using bazel
 bazel build //src/ray/...
@@ -93,6 +113,11 @@ bazel build //src/ray/...
 cd python && ./build-wheel-manylinux2014.sh  # Linux
 cd python && ./build-wheel-macos.sh          # macOS
 ```
+
+### Known Build Issues
+
+- **Bazel Version Compatibility**: Ray 2.50.0 may have compatibility issues with Bazel 5.4.0. Use Python-only mode if you don't need C++ compilation.
+- **Network Issues**: Google Cloud Storage (storage.googleapis.com) may be blocked in some regions, affecting Bazel dependency downloads.
 
 ## Lint and Format
 
