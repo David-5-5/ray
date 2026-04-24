@@ -716,7 +716,7 @@ def start(
     ray_debugger_external,
     disable_usage_stats,
     labels,
-    labels_file,
+    labels_file, # 优先尝试新字符串格式解析
     include_log_monitor,
     enable_resource_isolation,
     system_reserved_cpu,
@@ -735,6 +735,7 @@ def start(
 
     # Compose labels passed in with `--labels` and `--labels-file`.
     # In the case of duplicate keys, the values from `--labels` take precedence.
+    # 尝试新字符串格式解析
     try:
         labels_from_file = parse_node_labels_from_yaml_file(labels_file)
     except Exception as e:
