@@ -6,11 +6,9 @@
 如果编译 C++，可执行文件会在哪个目录下？变量 `GCS_SERVER_EXECUTABLE` 能够对应到编译的目录下吗？
 
 ---
-
 ## 分析结论
 
 ### 1. Bazel 编译输出目录
-
 **编译目标：**
 - **GCS Server**: `//src/ray/gcs:gcs_server`
 - **Raylet**: `//src/ray/raylet`
