@@ -5,6 +5,7 @@ Mini-Ray @ray.remote 装饰器实现
 """
 
 import sys
+import inspect
 import pickle
 import time
 import grpc
@@ -28,7 +29,6 @@ class RemoteFunction:
 
     def __init__(self, func):
         self.func = func
-        self.function_data = pickle.dumps(func)
 
     def remote(self, *args, **kwargs):
         """提交远程任务
@@ -38,13 +38,16 @@ class RemoteFunction:
         if _global_client is None:
             raise RuntimeError("请先调用 ray.init() 初始化")
 
-        # 序列化参数
+        # 序列化函数源码和参数（纯 Python 方案，彻底绕过 pickle 限制）
+        func_source = inspect.getsource(self.func)
+        func_name = self.func.__name__
+        function_data = pickle.dumps((func_source, func_name))
         args_data = pickle.dumps(args)
         kwargs_data = pickle.dumps(kwargs)
 
         # 通过 gRPC 提交任务到 Scheduler
         response = _global_client.stub.SubmitTask(pb2.SubmitTaskRequest(
-            function_data=self.function_data,
+            function_data=function_data,
             args_data=args_data,
             kwargs_data=kwargs_data
         ))

@@ -85,10 +85,21 @@ class Worker:
         try:
             print(f"[Worker] 开始执行任务: {task.task_id}")
 
-            # 反序列化函数和参数
-            func = pickle.loads(task.function_data)
+            # 反序列化函数源码和参数（纯 Python 方案）
+            func_source, func_name = pickle.loads(task.function_data)
             args = pickle.loads(task.args_data)
             kwargs = pickle.loads(task.kwargs_data)
+
+            # 剥离装饰器行（@开头的行），Worker 端不需要装饰器
+            lines = func_source.split('\n')
+            while lines and lines[0].strip().startswith('@'):
+                lines.pop(0)
+            func_source_clean = '\n'.join(lines)
+
+            # 从源码重建函数
+            exec_globals = {}
+            exec(func_source_clean, exec_globals)
+            func = exec_globals[func_name]
 
             # 执行用户代码
             result = func(*args, **kwargs)
