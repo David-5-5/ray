@@ -1,0 +1,113 @@
+syntax = "proto3";
+
+package miniray;
+
+// 任务状态
+enum TaskStatus {
+  PENDING = 0;    // 等待调度
+  RUNNING = 1;    // 执行中
+  FINISHED = 2;   // 已完成
+  FAILED = 3;     // 失败
+}
+
+// 任务定义
+message Task {
+  string task_id = 1;           // 任务唯一ID
+  bytes function_data = 2;      // 序列化的函数
+  bytes args_data = 3;          // 序列化的参数
+  bytes kwargs_data = 4;        // 序列化的关键字参数
+  TaskStatus status = 5;        // 任务状态
+  bytes result = 6;             // 执行结果
+  string error = 7;             // 错误信息
+  string worker_id = 8;         // 分配的 Worker ID
+}
+
+// Worker 注册请求
+message RegisterWorkerRequest {
+  string worker_id = 1;
+  string worker_address = 2;    // Worker gRPC 地址
+  int32 cpu_cores = 3;          // 可用 CPU 核数（简化）
+}
+
+// Worker 注册响应
+message RegisterWorkerResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// 提交任务请求
+message SubmitTaskRequest {
+  bytes function_data = 1;
+  bytes args_data = 2;
+  bytes kwargs_data = 3;
+}
+
+// 提交任务响应
+message SubmitTaskResponse {
+  string task_id = 1;
+  bool success = 2;
+  string message = 3;
+}
+
+// 获取任务结果请求
+message GetTaskResultRequest {
+  string task_id = 1;
+}
+
+// 获取任务结果响应
+message GetTaskResultResponse {
+  TaskStatus status = 1;
+  bytes result = 2;
+  string error = 3;
+}
+
+// Worker 拉取任务请求
+message PullTaskRequest {
+  string worker_id = 1;
+}
+
+// Worker 拉取任务响应
+message PullTaskResponse {
+  bool has_task = 1;
+  Task task = 2;
+}
+
+// Worker 上报任务结果请求
+message ReportTaskResultRequest {
+  string task_id = 1;
+  string worker_id = 2;
+  bool success = 3;
+  bytes result = 4;
+  string error = 5;
+}
+
+// Worker 上报任务结果响应
+message ReportTaskResultResponse {
+  bool success = 1;
+}
+
+// 心跳请求
+message HeartbeatRequest {
+  string worker_id = 1;
+  int32 running_tasks = 2;
+}
+
+message HeartbeatResponse {
+  bool ok = 1;
+}
+
+// Scheduler 服务
+service SchedulerService {
+  // Worker 注册
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  // Worker 心跳
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  // Worker 拉取任务
+  rpc PullTask(PullTaskRequest) returns (PullTaskResponse);
+  // Worker 上报任务结果
+  rpc ReportTaskResult(ReportTaskResultRequest) returns (ReportTaskResultResponse);
+  // 客户端提交任务
+  rpc SubmitTask(SubmitTaskRequest) returns (SubmitTaskResponse);
+  // 客户端获取任务结果
+  rpc GetTaskResult(GetTaskResultRequest) returns (GetTaskResultResponse);
+}
