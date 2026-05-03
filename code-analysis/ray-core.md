@@ -1256,7 +1256,367 @@ class MyCustomStorage(ExternalStorage):
 
 ---
 
+## 4. ray.init() 客户端初始化流程
+
+**关键文件**: `python/ray/_private/worker.py`
+
+`ray.init()` 是用户连接 Ray 集群的入口，负责建立连接、初始化本地服务、注册 Driver 进程。
+
+### 4.1 初始化核心阶段
+
+```python
+def init(
+    address: Optional[str] = None,
+    num_cpus: Optional[int] = None,
+    num_gpus: Optional[int] = None,
+    resources: Optional[Dict[str, float]] = None,
+    log_to_driver: bool = True,
+    runtime_env: Optional[Dict[str, Any]] = None,
+    # ... 共 30+ 个参数
+):
+```
+
+**执行流程**:
+```
+ray.init(address=None)
+    ↓
+1. 连接模式判定
+   ├── "auto" → 自动发现本地集群
+   ├── "localhost:6379" → 显式指定
+   └── None → 启动本地嵌入式集群
+    ↓
+2. 初始化 CoreWorker C++ 对象
+    ↓
+3. 启动本地 Raylet（如果是嵌入式模式）
+    ↓
+4. 注册 Driver 到 GCS
+    ↓
+5. runtime_env 配置生效
+    ↓
+6. 返回连接验证与 Dashboard URL
+```
+
+---
+
+## 5. Actor 模型深入
+
+### 5.1 Actor 生命周期管理
+
+**关键文件**: `src/ray/gcs/gcs_actor_manager.h`
+
+GcsActorManager 负责整个集群 Actor 的状态机：
+
+```cpp
+class GcsActorManager {
+private:
+    // ActorTable actor_table_;           // Actor 元数据持久化
+    ActorScheduler scheduler_;              // 调度器
+    std::unordered_map<ActorID, std::shared_ptr<GcsActor>> actors_;
+};
+```
+
+**Actor 状态转换完整链**:
+```
+  DEPENDENCIES_UNREADY
+        ↓ (依赖就绪)
+  PENDING_CREATION
+        ↓ (已分配节点)
+  REQUESTING_WORKER
+        ↓ (Worker 租约已获取)
+  CREATING
+        ↓ (Worker 创建成功)
+  ALIVE ←────┐
+        │     │ 重启
+        ▼     │
+  RESTARTING ─┘
+        ↓
+  DEAD
+```
+
+### 5.2 Actor 调度策略
+
+| 策略 | 说明 | 适用场景 |
+|------|------|---------|
+| **DEFAULT** | 默认，根据资源分布选择 | 普通场景 |
+| **SPREAD** | 尽量分布在不同节点 | 高可用场景 |
+| **PACK** | 尽量集中在少数节点 | 资源利用率 |
+| **NODE_AFFINITY** | 绑定到指定节点标签 | 异构硬件 |
+| **WORKER_AFFINITY** | 复用 Worker 进程 | 状态预热 |
+
+---
+
+## 6. 序列化机制 (CloudPickle)
+
+**关键文件**: `python/ray/_private/serialization.py`
+
+### 6.1 序列化层级架构
+
+Ray 使用多层序列化栈：
+
+```
+用户 Python 对象
+      ↓
+┌─────────────────────────────────┐
+│  cloudpickle 序列化            │  ← 函数、类、闭包等
+└──────────┬──────────────────────┘
+           ↓
+┌──────────┴──────────────────────┐
+│  PyArrow 格式优化                │  ← Arrow Table、Pandas
+└──────────┬──────────────────────┘
+           ↓
+┌──────────┴──────────────────────┐
+│  Plasma 共享内存                │  ← 零拷贝存储
+└─────────────────────────────────┘
+```
+
+### 6.2 关键优化点
+
+| 优化 | 效果 |
+|------|------|
+| **函数缓存** | 相同函数只序列化一次，后续传引用 |
+| **Arrow 零拷贝** | Arrow 数据直接写入 Plasma |
+| **自定义序列化器** | 用户可注册 `__reduce__` 自定义 |
+| **原地反序列化** | 直接从共享内存构建对象 |
+
+---
+
+## 7. 资源调度系统
+
+**关键文件**: `src/ray/raylet/scheduling/cluster_resource_scheduler.h`
+
+### 7.1 资源模型
+
+```cpp
+struct ResourceRequest {
+    std::unordered_map<std::string, FixedPoint> resources;
+    // CPU, GPU, memory, object_store_memory, custom...
+};
+```
+
+**内置资源类型**:
+| 资源 | 单位 | 说明 |
+|------|------|------|
+| CPU | 核数 | 默认按逻辑核心数 |
+| GPU | 卡数 | CUDA_VISIBLE_DEVICES 自动分配 |
+| memory | 字节 | Worker 进程预留内存 |
+| object_store_memory | 字节 | Plasma 对象存储 |
+| 自定义资源 | 用户定义 | 如 "FPGA", "TPU" 等 |
+
+### 7.2 调度算法流程
+
+```
+任务资源请求
+      ↓
+1. 过滤不可用节点
+      ↓
+2. 打分排序（Scores）
+   ├── 资源匹配度
+   ├── 节点负载
+   └── 对象亲和性
+      ↓
+3. 选择最佳节点
+      ↓
+4. 资源预占
+      ↓
+5. 返回 Worker 租约
+```
+
+---
+
+## 8. 任务执行引擎
+
+**关键文件**: `src/ray/core_worker/task_executor.h`
+
+### 8.1 执行器架构
+
+```cpp
+class TaskExecutor {
+public:
+    void Execute(TaskSpecification task);
+private:
+    TaskFinisherInterface &task_finisher_;
+    // 多种执行模式
+    // ── 同步执行
+    // ── 异步执行（线程池）
+    // └── Actor 执行
+};
+```
+
+### 8.2 任务执行模式
+
+| 模式 | 线程模型 | 适用 |
+|------|----------|------|
+| **同步执行** | 当前线程 | 小任务快速执行 |
+| **线程池执行** | 专用线程池 | 计算密集型 |
+| **Actor 专用** | 单线程顺序 | 有状态 Actor |
+| **IO 优化** | asyncio 事件循环 | IO 密集型 |
+
+---
+
+## 9. 运行时环境 (Runtime Env)
+
+**关键文件**: `python/ray/_private/runtime_env/agent.py`
+
+### 9.1 Runtime Env 核心功能
+
+允许每个 Job/Actor 拥有独立环境：
+
+```python
+runtime_env = {
+    "pip": ["requests==2.26.0"],      # pip 包
+    "conda": "environment.yml",        # Conda 环境
+    "env_vars": {"DEBUG": "1"},        # 环境变量
+    "working_dir": "./src/",           # 工作目录
+    "py_modules": ["module_a"],        # 模块注入
+    "container": "docker://ray:latest", # 容器镜像
+}
+```
+
+### 9.2 安装流程
+
+```
+用户提交 runtime_env
+       ↓
+1. 上传工作目录 → GCS 存储
+       ↓
+2. 目标节点 RuntimeEnvAgent 接收
+       ↓
+3. 缓存命中检查
+       ↓
+4. 异步安装（pip install / conda env create）
+       ↓
+5. 启动 Worker 时注入环境
+```
+
+---
+
+## 10. 错误处理与容错
+
+### 10.1 任务失败处理
+
+**关键文件**: `src/ray/core_worker/task_manager.cc`
+
+```
+任务执行失败
+       ↓
+┌──────────────────────────────────────┐
+│  重试判定                           │
+│  ├── Actor 死亡？→  Actor 重启      │
+│  ├── 系统错误？→  重试任务          │
+│  └── 用户异常？→  抛出给用户         │
+└──────────────────────────────────────┘
+       ↓
+重试次数达到上限？
+       ↓ 是
+标记 Task 为 FAILED
+       ↓
+异常对象序列化返回
+```
+
+### 10.2 节点故障检测
+
+| 故障类型 | 检测机制 | 恢复策略 |
+|----------|---------|---------|
+| **Worker 崩溃** | 心跳超时 | 重启 Worker，Actor 重建 |
+| **Raylet 崩溃** | GCS 节点失联 | 标记节点死亡，任务重调度 |
+| **网络分区** | Lease 超时 | 任务重试其他节点 |
+| **OOM 被杀** | cgroup OOM 事件 | 增加资源重试 |
+
+---
+
+## 11. 异步 API (asyncio 集成)
+
+**关键文件**: `python/ray/_private/async_compat.py`
+
+### 11.1 异步调度模型
+
+```python
+# Python asyncio 事件循环
+       ↓
+ray.get_async() 非阻塞等待
+       ↓
+CoreWorker C++ 事件循环
+       ↓
+对象就绪 → Python Future 回调
+```
+
+**关键 API**:
+| API | 作用 |
+|-----|------|
+| `ray.get_async()` | 异步获取对象 |
+| `ray.wait_async()` | 异步等待对象 |
+| `asyncio.gather()` | 并发执行多个任务 |
+
+---
+
+## 12. 命名 Actor (Named Actor)
+
+**关键文件**: `src/ray/gcs/gcs_actor_manager.h`
+
+### 12.1 命名空间机制
+
+```cpp
+// 按名称查找 Actor
+ActorID GcsActorManager::GetNamedActor(
+    const std::string &name,
+    const std::string &namespace
+);
+```
+
+**应用场景**:
+- 全局单例服务（如配置中心）
+- 跨 Job 共享状态
+- 服务发现与治理
+
+```python
+# 创建命名 Actor
+@ray.remote
+class MyService:
+    pass
+
+# Job A: 启动服务
+handle = MyService.options(name="my_service", namespace="global").remote()
+
+# Job B: 跨作业获取句柄
+handle = ray.get_actor("my_service", namespace="global")
+```
+
+---
+
+## 13. 序列化优化与最佳实践
+
+### 13.1 常见性能陷阱
+
+| 问题 | 原因 | 优化方案 |
+|------|------|---------|
+| **大对象序列化慢** | Python pickle 序列化 1GB 数秒 | 使用 ray.put() 预序列化 |
+| **重复序列化函数** | 每次任务重复序列化相同函数 | 函数缓存 + 引用传递 |
+| **闭包捕获大对象** | 序列化时意外捕获全局变量 | 显式传参，避免闭包 |
+| **自定义类序列化** | 复杂类递归序列化开销大 | 实现 `__reduce__` 优化 |
+
+### 13.2 性能优化手段
+
+```python
+# 1. 预序列化大对象
+big_obj = load_huge_data()
+obj_ref = ray.put(big_obj)  # 只序列化一次
+
+# 2. 避免闭包捕获
+@ray.remote
+def process(data):
+    return data * 2
+
+# 3. 自定义序列化器
+class MyClass:
+    def __reduce__(self):
+        # 返回轻量级表示
+        return (self.__class__, (self.id,))
+```
+
+---
+
 *文档生成时间: 2024-04-25*
 *重构时间: 2024-04-25 - 按调用链组织并建立交叉引用*
 *新增章节时间: 2024-04-27 - 新增对象存储与外部存储集成*
 *结构整理时间: 2024-04-27 - 统一数字编号，使用 [toc] 自动目录*
+*Ray Core 关键技术点补充: 2024-04-29 - 新增第 4-13 章（概要版）*
