@@ -1391,30 +1391,457 @@ ds2 = ds.map(fn2)  # ds._plan.copy() 再次复制，互不影响
 
 ## 5. Execution Plan（执行计划层）
 
-**文件位置**: `python/ray/data/_internal/plan.py`
+**核心目录**: `python/ray/data/_internal/plan.py`, `python/ray/data/_internal/planner/`
 
-`ExecutionPlan` 是连接逻辑计划和物理执行的桥梁。
+ExecutionPlan 是连接 Logical Plan（用户 API DAG）和 Streaming Executor（实际执行）的核心枢纽，负责三阶段优化、逻辑到物理转换、执行调度和结果缓存。
 
-### 5.1 核心职责
+---
 
-1. **逻辑优化**：算子融合（Fusion）、谓词下推、投影下推
-2. **物理计划生成**：将 Logical Operator 转换为 Physical Operator
-3. **执行调度**：创建 StreamingExecutor 并调度执行
+### 5.1 ExecutionPlan 整体架构
 
-### 5.2 ExecutionPlan 核心方法
+ExecutionPlan 处于整个执行流水线的中间位置，负责将用户构建的逻辑计划转化为可执行的物理计划：
+
+```
+用户 API 调用
+    ↓
+构建 Logical Operator DAG
+    ↓
+[LogicalPlan 容器]
+    ↓
+[ExecutionPlan 链接] ← 本章节
+    ↓
+三阶段优化流水线：
+    1. 逻辑优化（Limit下推、投影下推、Batch格式继承）
+    2. Planner 转换（Logical → Physical Operator）
+    3. 物理优化（算子融合、Block大小继承、并行度设置）
+    ↓
+StreamingExecutor 执行
+```
+
+**核心职责清单**：
+
+| 职责 | 说明 | 关键代码 |
+|------|------|---------|
+| **逻辑优化** | 应用逻辑层优化规则，不改变执行语义 | `LogicalOptimizer` |
+| **计划转换** | 逻辑算子映射到物理算子 | `Planner.plan()` |
+| **物理优化** | 应用物理层优化，调整执行策略 | `PhysicalOptimizer` |
+| **Snapshot 缓存** | 已执行部分的结果缓存，避免重复计算 | `_snapshot_bundle` |
+| **Schema 推断** | 不执行即可推断输出 Schema | `schema()` |
+| **执行入口** | `execute()` 和 `execute_to_iterator()` | |
+| **Stats 收集** | 执行统计数据汇总 | `stats()` |
+
+---
+
+### 5.2 ExecutionPlan 类核心数据结构
+
+**代码位置**: `python/ray/data/_internal/plan.py` 第 36-88 行
 
 ```python
 class ExecutionPlan:
-    def create_executor(self) -> StreamingExecutor:
-        """创建流式执行器"""
-        return StreamingExecutor(self._context, self.get_dataset_id())
+    """Dataset 的懒执行计划容器
     
-    def explain(self) -> str:
-        """打印逻辑计划和物理计划"""
-        logical_plan = self._logical_plan
-        physical_plan = get_execution_plan(self._logical_plan)
-        return logical_plan_str + physical_plan_str
+    内部持有：
+    1. 算子链计算快照（snapshot）
+    2. LogicalPlan 引用
+    3. DataContext 执行配置
+    """
+    
+    def __init__(self, stats: DatasetStats, data_context: DataContext):
+        # 输入统计
+        self._in_stats = stats
+        
+        # 计算快照：已执行的算子前缀
+        self._snapshot_operator: Optional[LogicalOperator] = None
+        self._snapshot_stats = None
+        self._snapshot_bundle = None       # 缓存的结果 blocks
+        
+        # Schema 缓存（不持有 blocks，仅元数据）
+        self._snapshot_metadata_schema: Optional[BlockMetadataWithSchema] = None
+        self._schema = None
+        
+        # 执行标识
+        self._dataset_uuid = None           # Dataset 唯一标识
+        self._run_index = -1                # 执行计数（每次执行 +1）
+        self._has_started_execution = False # 是否已开始执行
+        self._context = data_context
 ```
+
+**Snapshot 机制是核心设计**：
+- 多次执行同一个 Dataset 时，已执行的前缀不重复计算
+- 例如：`ds.take(5)` 后再 `ds.count()`，可以复用已计算的 blocks
+- 这是 Ray Data "看起来懒执行但实际上有缓存" 的关键
+
+---
+
+### 5.3 三阶段优化流水线
+
+**代码位置**: `python/ray/data/_internal/logical/optimizers.py` 第 68-81 行
+
+```python
+def get_execution_plan(logical_plan: LogicalPlan) -> PhysicalPlan:
+    """完整优化流水线：三阶段处理
+    
+    (1) 逻辑优化：Logical Operator DAG → 优化后的 Logical Operator DAG
+    (2) 计划转换：Logical Operator → Physical Operator
+    (3) 物理优化：Physical Operator DAG → 可执行的 Physical Operator DAG
+    """
+    # 阶段 1: 逻辑优化
+    optimized_logical_plan = LogicalOptimizer().optimize(logical_plan)
+    logical_plan._dag = optimized_logical_plan.dag
+    
+    # 阶段 2: Planner 转换
+    physical_plan = create_planner().plan(optimized_logical_plan)
+    
+    # 阶段 3: 物理优化
+    return PhysicalOptimizer().optimize(physical_plan)
+```
+
+---
+
+#### 5.3.1 逻辑优化规则（3条）
+
+应用于 Logical Operator DAG，不改变执行语义：
+
+| 规则 | 作用 | 代码位置 |
+|------|------|---------|
+| `InheritBatchFormatRule` | Batch 格式（pandas/arrow/numpy）向下游算子继承 | |
+| `LimitPushdownRule` | Limit 算子尽可能下推到数据源，减少处理数据量 | |
+| `ProjectionPushdown` | 列裁剪（只读取需要的列）下推到 Read 算子 | |
+
+---
+
+#### 5.3.2 物理优化规则（4条）
+
+应用于 Physical Operator DAG，直接影响执行策略：
+
+| 规则 | 作用 | 代码位置 |
+|------|------|---------|
+| `InheritTargetMaxBlockSizeRule` | Block 大小配置向下游算子继承 | |
+| `SetReadParallelismRule` | 设置 Read 算子的读取并行度 | |
+| `FuseOperators` | **最重要优化** - 相邻 Map 算子融合 | |
+| `ConfigureMapTaskMemoryUsingOutputSize` | 根据输出大小配置 Map 任务内存 | |
+
+---
+
+#### 5.3.3 Optimizer 不动点迭代机制
+
+**代码位置**: `interfaces/optimizer.py` 第 30-47 行
+
+```python
+class Optimizer:
+    def optimize(self, plan: Plan) -> Plan:
+        """迭代应用规则直到 DAG 不再变化（不动点）
+        
+        设计原因：
+        1. 规则 A 可能触发规则 B 可应用
+        2. 例如：Limit 下推到 Read 后可能触发新的优化
+        3. 多次迭代直到 dag_str 不再改变
+        """
+        previous_plan = plan
+        while True:
+            for rule in self.rules:
+                plan = rule.apply(plan)
+            # 检测不动点（通过 dag_str 比较）
+            if plan.dag.dag_str == previous_plan.dag.dag_str:
+                break
+            previous_plan = plan
+        return plan
+```
+
+---
+
+### 5.4 Planner：逻辑到物理算子转换
+
+**代码位置**: `python/ray/data/_internal/planner/planner.py`
+
+Planner 负责将 Logical Operator DAG 转换为对应的 Physical Operator DAG，采用后序遍历递归转换。
+
+```python
+class Planner:
+    """Logical → Physical 算子转换器
+    
+    注意：只做转换，不做优化。优化由 Optimizer 完成。
+    """
+    
+    # 算子类型 → 转换函数 的映射表
+    _DEFAULT_PLAN_FNS = {
+        Read: plan_read_op,
+        Write: plan_write_op,
+        InputData: plan_input_data_op,
+        AbstractFrom: plan_from_op,
+        AbstractUDFMap: plan_udf_map_op,
+        AbstractAllToAll: plan_all_to_all_op,
+        Filter: plan_filter_op,
+        Union: plan_union_op,
+        Zip: plan_zip_op,
+        Limit: plan_limit_op,
+        Count: plan_count_op,
+        Project: plan_project_op,
+        Join: plan_join_op,
+        StreamingSplit: plan_streaming_split_op,
+        Download: plan_download_op,
+    }
+    
+    def plan(self, logical_plan: LogicalPlan) -> PhysicalPlan:
+        """后序递归转换整个 DAG"""
+        physical_dag, op_map = self._plan_recursively(
+            logical_plan.dag, logical_plan.context
+        )
+        return PhysicalPlan(physical_dag, op_map, logical_plan.context)
+```
+
+---
+
+#### 5.4.1 递归转换机制
+
+**代码位置**: `planner.py` 第 180-224 行
+
+```python
+def _plan_recursively(
+    self, logical_op: LogicalOperator, data_context: DataContext
+) -> Tuple[PhysicalOperator, Dict[LogicalOperator, PhysicalOperator]]:
+    """后序递归转换：先转换输入依赖，再转换当前算子"""
+    
+    op_map: Dict[PhysicalOperator, LogicalOperator] = {}
+    
+    # Step 1: 递归转换所有输入依赖（后序）
+    physical_children = []
+    for child in logical_op.input_dependencies:
+        physical_child, child_op_map = self._plan_recursively(child, data_context)
+        physical_children.append(physical_child)
+        op_map.update(child_op_map)
+    
+    # Step 2: 查找当前算子的转换函数
+    plan_fn = self.get_plan_fn(logical_op)
+    
+    # Step 3: 调用转换函数生成物理算子
+    physical_op = plan_fn(logical_op, physical_children, data_context)
+    
+    # Step 4: 建立物理算子到逻辑算子的反向映射
+    # 一个物理算子可能对应多个逻辑算子（算子融合后）
+    queue = [physical_op]
+    while queue:
+        curr_physical_op = queue.pop()
+        if curr_physical_op._logical_operators:
+            break  # 已设置，停止向上遍历
+        curr_physical_op.set_logical_operators(logical_op)
+        op_map[curr_physical_op] = logical_op
+        queue.extend(curr_physical_op.input_dependencies)
+    
+    op_map[physical_op] = logical_op
+    return physical_op, op_map
+```
+
+---
+
+#### 5.4.2 典型算子转换示例
+
+**Read 算子转换** → InputDataBuffer 或 MapOperator 执行 Read 任务
+```python
+def plan_read_op(
+    logical_op: Read,
+    physical_children: List[PhysicalOperator],
+    data_context: DataContext
+) -> PhysicalOperator:
+    # Read 没有输入依赖，直接创建 InputDataBuffer 或 MapOperator 来执行读取
+    return InputDataBuffer(...)  # 或 MapOperator
+```
+
+**Join 算子转换** → JoinOperator
+```python
+def plan_join_op(logical_op: Join, physical_children, data_context):
+    """两个输入：left_input_op, right_input_op"""
+    return JoinOperator(
+        left_input_op=physical_children[0],
+        right_input_op=physical_children[1],
+        join_type=logical_op._join_type,
+        num_partitions=logical_op._num_outputs,
+        ...
+    )
+```
+
+---
+
+### 5.5 Snapshot 机制：懒执行的核心
+
+Snapshot 是 ExecutionPlan 最精妙的设计之一，解决了"懒执行但不重复计算"的问题。
+
+#### 5.5.1 Snapshot 状态定义
+
+```python
+# 四个关键变量构成 Snapshot
+self._snapshot_operator: Optional[LogicalOperator] = None  # 已执行到哪个算子
+self._snapshot_stats = None                                # 执行统计
+self._snapshot_bundle = None                               # 缓存的结果 blocks
+self._snapshot_metadata_schema = None                      # 仅元数据缓存
+```
+
+**Snapshot 判定条件**（`has_computed_output()` 第 614-621 行）：
+```python
+def has_computed_output(self) -> bool:
+    """是否已完整执行整个 DAG"""
+    return (
+        self._snapshot_bundle is not None
+        and self._snapshot_operator == self._logical_plan.dag
+    )
+```
+
+---
+
+#### 5.5.2 两种执行模式
+
+**模式 1**: Eager Execute - 全量执行并缓存
+
+```python
+def execute(self, preserve_order: bool = False) -> RefBundle:
+    """全量执行，结果缓存到 snapshot
+    
+    再次执行时如果 has_computed_output() 为 True，直接返回缓存
+    """
+    if self.has_computed_output():
+        return self._snapshot_bundle  # 直接命中缓存
+    
+    # 执行完整 DAG...
+    with self.create_executor() as executor:
+        blocks = execute_to_legacy_block_list(executor, self, ...)
+    
+    # 缓存执行结果
+    self._snapshot_bundle = RefBundle(tuple(blocks.iter_blocks_with_metadata()), ...)
+    self._snapshot_operator = self._logical_plan.dag
+    return self._snapshot_bundle
+```
+
+**模式 2**: Streaming Iterator - 流式迭代，只缓存元数据
+
+```python
+def execute_to_iterator(self) -> Tuple[Iterator[RefBundle], DatasetStats, StreamingExecutor]:
+    """流式迭代，只缓存 Schema/元数据，不缓存 blocks
+    
+    适合：大数据量的场景，不希望全部结果驻留内存
+    """
+    if self.has_computed_output():
+        return iter([self._snapshot_bundle]), ..., None
+    
+    executor = self.create_executor()
+    bundle_iter = execute_to_legacy_bundle_iterator(executor, self)
+    
+    # 执行第一个 block 后缓存 Schema（元数据）
+    gen = iter(bundle_iter)
+    first_bundle = next(gen)
+    self._snapshot_metadata_schema = BlockMetadataWithSchema(...)
+    
+    return itertools.chain([first_bundle], gen), stats, executor
+```
+
+---
+
+### 5.6 Schema 推断机制
+
+Schema 推断是"看起来不执行但能获取元数据"的关键：
+
+```python
+def schema(self, fetch_if_missing: bool = False) -> Union[type, Schema]:
+    """获取输出 Schema，不触发执行除非指定
+    
+    优先级：
+    1. 已缓存的 Schema → 直接返回
+    2. 已执行有 snapshot → 从结果中获取
+    3. 逻辑算子推断 → `dag.infer_schema()`
+    4. 需要时真的执行少量数据获取 Schema
+    """
+    if self._schema is not None:
+        return self._schema
+    
+    if self.has_computed_output():
+        schema = self._snapshot_bundle.schema
+    else:
+        schema = self._logical_plan.dag.infer_schema()
+        if schema is None and fetch_if_missing:
+            # 真的需要执行，取第一个 Block 来推断 Schema
+            iter_ref_bundles, _, executor = self.execute_to_iterator()
+            with executor:
+                schema = _take_first_non_empty_schema(
+                    bundle.schema for bundle in iter_ref_bundles
+                )
+    
+    self.cache_schema(schema)
+    return self._schema
+```
+
+---
+
+### 5.7 Copy 机制：分支安全保证
+
+与 Logical Plan 一致，Execution Plan 也遵循不可变原则：
+
+```python
+def copy(self) -> "ExecutionPlan":
+    """浅拷贝 - 可以独立执行但共享缓存"""
+    plan_copy = ExecutionPlan(self._in_stats, data_context=self._context)
+    if self._snapshot_bundle is not None:
+        plan_copy._snapshot_bundle = self._snapshot_bundle  # 共享缓存
+        plan_copy._snapshot_operator = self._snapshot_operator
+        plan_copy._snapshot_stats = self._snapshot_stats
+    return plan_copy
+
+def deep_copy(self) -> "ExecutionPlan":
+    """深拷贝 - 完全独立"""
+    plan_copy = ExecutionPlan(
+        copy.copy(self._in_stats),
+        data_context=self._context.copy(),
+    )
+    if self._snapshot_bundle:
+        plan_copy._snapshot_bundle = copy.copy(self._snapshot_bundle)
+        plan_copy._snapshot_operator = copy.copy(self._snapshot_operator)
+        plan_copy._snapshot_stats = copy.copy(self._snapshot_stats)
+    return plan_copy
+```
+
+---
+
+### 5.8 设计模式深度解析
+
+#### 5.8.1 不动点迭代模式
+
+```
+Optimizer.optimize() 采用的是：
+  迭代应用规则集合
+    ↓
+  直到 DAG 不再变化（dag_str 相同）
+    ↓
+  达到不动点
+```
+
+优点：
+- 规则间不需要显式声明依赖顺序
+- 可扩展：新增规则只需要加入集合
+- 健壮：自动处理规则间的相互触发
+
+缺点：
+- `dag_str` 比较比较脆弱（字符串变化不等于语义变化）
+- 最坏情况复杂度：O(规则数 × DAG 深度 × 迭代轮次)
+
+---
+
+#### 5.8.2 访问者模式
+
+Planner 采用的是访问者模式的变体：
+- `_plan_recursively()` 遍历 DAG（遍历逻辑）
+- 各 `plan_*_op()` 函数处理具体算子类型（访问逻辑）
+
+分离了遍历和处理逻辑，新增算子类型只需添加处理函数。
+
+---
+
+### 5.9 关键研究方向
+
+| 方向 | 问题 | 收益潜力 |
+|------|------|---------|
+| **增量优化** | 每次 DAG 小修改不需要全量重新优化 | ★★★★☆ |
+| **优化规则热路径** | 静态分析找出可快速跳过的规则 | ★★★☆☆ |
+| **Snapshot 增量持久化** | 可复用的 Checkpoint 机制 | ★★★★☆ |
+| **dag_str 替代** | 字符串比较改为结构哈希比较 | ★★☆☆☆ |
+| **更精确的元数据传递** | 行数、大小估计在算子间更精确传递 | ★★★☆☆ |
 
 ---
 
