@@ -194,7 +194,74 @@ Hive = Calcite CBO + 上百条规则（join 重排序、分区裁剪、代价模
 
 ---
 
-## 7. 关键源码索引
+## 8. 优化器的边界：哪些优化不做
+
+Ray Data 优化器**刻意保守**，很多数据库经典优化它不实现，责任留给用户。
+
+### 8.1 无谓词下推：`sort().filter()` 不会重排为 `filter().sort()`
+
+逻辑规则集只有 3 条（[optimizers.py:23-30](../python/ray/data/_internal/logical/optimizers.py#L23)），**没有 FilterPushdown / PredicatePushdown**。所以：
+
+```python
+ds.sort("age").filter(expr=col("age") > 18)
+# DAG 原样保留 Read → Sort → Filter（先全量排序 shuffle，再过滤）
+# 不会被优化成 Read → Filter → Sort
+```
+
+这个重排在关系代数上完全合法（filter 与 sort 可交换，先 filter 减少 sort 数据量），Spark Catalyst / Hive Calcite 会自动做，但 **Ray Data 不做**。
+
+**佐证**：唯一的下推规则 `LimitPushdownRule` 文档明文规定"遇到 Sort/Shuffle/Aggregate/Read 就停止下推"（[limit_pushdown.py:23-24](../python/ray/data/_internal/logical/rules/limit_pushdown.py#L23)）。连更简单的 Limit 下推都不敢穿过 AllToAll，更没实现 Filter 穿 Sort。原因：`Sort` 继承 `AbstractAllToAll`（[all_to_all_operator.py:147](../python/ray/data/_internal/logical/operators/all_to_all_operator.py#L147)），根本不在 `AbstractOneToOne.can_modify_num_rows()` 判定体系内。
+
+### 8.2 实践准则
+
+在 Ray Data 里**手动把 filter/select 放在 sort/groupby/shuffle 之前**——优化器不会替你搬。这是与 Spark/Hive 使用习惯的重要差异。
+
+---
+
+## 9. 优化后 DAG 的测试验证
+
+Ray Data 用一套标准模式验证 `LogicalOptimizer` 优化结果，核心工具是 `LogicalOperator.dag_str`（与 `Optimizer.optimize()` 判不动点收敛用的是同一字符串表示）。
+
+### 9.1 双重断言模式
+
+`_check_valid_plan_and_result`（[test_execution_optimizer_limit_pushdown.py:14-25](../python/ray/data/tests/test_execution_optimizer_limit_pushdown.py#L14)）：
+
+```python
+assert ds.take_all() == expected_result                      # ① 语义正确性
+assert ds._plan._logical_plan.dag.dag_str == expected_plan   # ② DAG 结构正确性
+```
+
+既验证优化没改结果，又验证优化确实改了 DAG 结构。例：
+
+```python
+ray.data.range(100).limit(50).limit(80).limit(5).limit(20)
+  → dag_str == "Read[ReadRange] -> Limit[limit=5]"   # 四个 Limit 融合成 min=5
+```
+
+### 9.2 测试文件分工
+
+| 测试文件 | 验证对象 | 断言方式 |
+|---|---|---|
+| `test_execution_optimizer_limit_pushdown.py` | LimitPushdown 后逻辑 DAG | `dag.dag_str == expected` |
+| `test_operator_fusion.py` | 融合后物理 DAG | 断言算子 `.name`（如 `"ReadParquet->MapBatches(<lambda>)"`）+ `.input_dependencies` |
+| `test_projection_fusion.py` | ProjectionPushdown | dag_str / name 断言 |
+| `test_ruleset.py` | 规则**排序机制**（非 DAG 结果） | `list(ruleset) == [...]`、循环检测 |
+
+### 9.3 "下推遇 Sort 停止"的可执行证据
+
+[test_limit_pushdown_union_with_sort:296-311](../python/ray/data/tests/test_execution_optimizer_limit_pushdown.py#L296)：
+
+```python
+ds = ds1.union(ds2).sort("id").limit(5)
+expected_plan = "... Union[Union] -> Sort[Sort] -> Limit[limit=5]"
+# docstring: "Limit after Union + Sort: limit must NOT push through the Sort."
+```
+
+Limit 仍在 Sort 下游——官方用断言明确"有意不让下推穿过 Sort"，佐证第 8 节的保守边界结论。
+
+---
+
+## 10. 关键源码索引
 
 | 内容 | 位置 |
 |---|---|
