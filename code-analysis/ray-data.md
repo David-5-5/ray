@@ -2090,3 +2090,97 @@ result = ds.count()  # 这里开始真正执行
 | 测试文件 | 大小 | 测试内容 |
 |---------|------|---------|
 | `test_autoscaler.py` | 11KB | Actor 自动扩缩容逻辑、资源利用率优化 |
+
+---
+
+## 13. 从用户代码到 LogicalPlan：DAG 的构建
+
+> 关联专题：算子类型与优化规则详见 [ray-data-operators-and-optimizer.md](ray-data-operators-and-optimizer.md)。
+
+### 13.1 澄清：`@ray.remote` 不生成 LogicalPlan
+
+`@ray.remote` 是 **Ray Core** 的 task/actor API，与 Ray Data 的 LogicalPlan 无关。生成 `LogicalPlan` 的是 **Dataset API**（`ray.data.read_*().map_batches().filter()...`）。
+
+### 13.2 无"解析"步骤：方法调用链自身即建图
+
+关键认知：Ray Data **不做词法/句法解析**（与 Hive 的 SQL 编译器路径本质不同）。Python 方法调用本身就是"指令流"——`ds.filter(g)` 里的 `g` 已是 Python 函数对象，无需再解析。每个变换方法内部执行统一的**四步范式**（以 `filter` 为例，[dataset.py](../python/ray/data/dataset.py) 约 1566-1594 行）：
+
+```python
+input_op = self._logical_plan.dag          # ① 取当前链尾算子作为输入
+filter_op = Filter(input_op=input_op, ...) # ② new 新算子，input_dependencies 指向 input_op（连边）
+plan = self._plan.copy()
+logical_plan = LogicalPlan(filter_op, self.context)  # ③ 新算子成为新 LogicalPlan 的 dag
+return Dataset(plan, logical_plan)                   # ④ 返回全新 Dataset
+```
+
+调 N 次变换方法，就逐节 new 出 N 个 `LogicalOperator` 并用 `input_dependencies` 反向连边，DAG 自动"长"出来。
+
+### 13.3 DAG 方向与两个 plan
+
+- `LogicalPlan.dag` 指向**最下游**算子；沿 `input_dependencies` 向上游追溯到 Source（Read）。这解释了为何所有优化规则都"从 dag 出发沿 input_dependencies 往上"遍历。
+- `Dataset` 同时持有两个 plan（[dataset.py:254-256](../python/ray/data/dataset.py#L254-L256)）：`_logical_plan`（算子 DAG，蓝图）与 `_plan`（`ExecutionPlan`，惰性执行容器 + 结果快照 `_snapshot_bundle`）。
+
+### 13.4 惰性执行：建 DAG ≠ 执行
+
+变换方法（`.filter`/`.map_batches`）**只记账不执行**——到 `return Dataset(...)` 为止一行数据未读。只有**消费操作**（`take`/`count`/`iter_batches`/`write_*`）才触发流水线（对应 `get_execution_plan()`）：
+
+```
+LogicalPlan
+  → LogicalOptimizer 优化（Limit/Projection 下推…）
+  → Planner 翻译成 PhysicalPlan
+  → PhysicalOptimizer 优化（融合…）
+  → StreamingExecutor 真正执行（此刻才读数据、跑 UDF）
+```
+
+**验证现象**：若 UDF `f` 有 bug，`ds.map_batches(f)` 那行不会报错，崩溃发生在 `take()` 那一刻——这是"建 plan"与"执行 plan"分属两个时刻的铁证。
+
+### 13.5 与 Hive/Spark 的路径对比
+
+| | SQL 编译器路径（Hive 主流） | 程序化 Builder 路径（Ray Data） |
+|---|---|---|
+| 输入 | HQL 字符串 | Python 方法调用 |
+| 建图 | ANTLR 解析→AST→SemanticAnalyzer 一次性生成整棵树 | 每次方法调用追加一个节点，逐节生长 |
+| 列名/类型解析 | 语义分析阶段全局查 catalog | 延迟到执行前 `infer_schema` |
+| 灵活度 | 仅限 SQL 可表达 | 可嵌任意 Python UDF |
+
+Ray Data 的链式调用 ≈ **Calcite 的 `RelBuilder`**（程序化构建），而非 Hive 面向用户的 SQL 编译器。Spark 两者皆有（`spark.sql(...)` vs `df.filter().groupBy()`），最终都汇聚到 Catalyst LogicalPlan。
+
+---
+
+## 14. 分布式执行：不同算子发送给 worker 的差异
+
+> 核心结论：物理算子**不是**统一的"发 UDF 给 worker"模型，而是**四种截然不同的执行形态**。
+
+### 14.1 什么被序列化、什么留在 driver
+
+- **plan 不出 driver**：LogicalPlan/PhysicalPlan 只在 driver 控制"提交哪些 task"。
+- **序列化并分发的是**：计算逻辑（`MapTransformer`，含 UDF）+ 数据块引用（`ObjectRef`）。
+- **UDF 序列化时机**：算子**构造时** `ray.put(map_transformer)`（[map_operator.py:311](../python/ray/data/_internal/execution/operators/map_operator.py#L311)），**非执行时**；执行时 task 只传引用。
+- task 实际传参（[task_pool_map_operator.py:106-112](../python/ray/data/_internal/execution/operators/task_pool_map_operator.py#L106)）：`transformer_ref` + `data_context` + `ctx` + `*block_refs`。
+
+### 14.2 四类算子的 worker 执行差异
+
+| 类型 | 代表算子 | 提交方式 | 发什么 | 流式? | worker 生命周期 |
+|---|---|---|---|---|---|
+| **TaskPoolMap** | filter/map/无状态 map_batches | `_map_task.options().remote()`（[task_pool:106](../python/ray/data/_internal/execution/operators/task_pool_map_operator.py#L106)） | transformer_ref + block_refs | ✅ 逐块提交 | 用完即弃（无状态 task） |
+| **ActorPoolMap** | 有状态 UDF（callable class） | 先 `ray.remote(cls)` 建 actor，再 `actor.submit.remote()`（[actor_pool:204,306](../python/ray/data/_internal/execution/operators/actor_pool_map_operator.py#L204)） | 同上，但目标是常驻 actor | ✅ | **常驻**，跨 task 保持状态 |
+| **AllToAll** | sort/shuffle/aggregate/repartition | driver 上 `_bulk_fn(input_buffer)`（[base_physical_operator:122](../python/ray/data/_internal/execution/operators/base_physical_operator.py#L122)），内部经 exchange 调度器提交多轮 map/reduce/sample task | **数据对象**（如 `SortKey`），非 Python UDF | ❌ **barrier** | 多阶段 task 图 |
+| **InputDataBuffer** | 源头缓冲 | **不提交 task**（[input_data_buffer.py:12](../python/ray/data/_internal/execution/operators/input_data_buffer.py#L12)） | 仅供给已物化 block ref | — | — |
+
+### 14.3 以 `ds.filter(expr=col("age")>18).sort("age", descending=True)` 为例
+
+- **filter 走类型 1（TaskPoolMap）**：plan 阶段一次序列化表达式（`col("age")>18` 是 `Expr` 对象，走 Arrow native 列式过滤，见 [plan_udf_map_op.py:222-237](../python/ray/data/_internal/planner/plan_udf_map_op.py#L222)），执行时流式逐块提交 task。
+- **sort 走类型 3（AllToAll）**：barrier——上游 filter 100% 完成后 `all_inputs_done()` 一次性 `_bulk_fn`，内部多阶段（采样→map分区→reduce排序）；分发的是 `SortKey`（`{"age":"descending"}`）纯数据对象，非用户函数。
+
+### 14.4 filter 的两条路径（UDF 形态）
+
+| 写法 | 序列化发出的"UDF" | worker 执行 | 物理 transform |
+|---|---|---|---|
+| `filter(fn=lambda r: r["age"]>18)` | 你的**函数**（cloudpickle） | 逐行调 Python `fn(row)` | `RowMapTransformFn` |
+| `filter(expr=col("age")>18)` | **表达式树**（结构化数据，无 Python 函数） | Arrow 列式向量化 | `BlockMapTransformFn` |
+
+官方推荐 `expr` 写法（native、无 Python 调用开销）——`dataset.py` 里 `fn` 写法带 "Use 'expr' instead of 'fn' when possible" 提示。
+
+### 14.5 调度心跳
+
+`StreamingExecutor._scheduling_loop_step`（[streaming_executor.py:450-463](../python/ray/data/_internal/execution/streaming_executor.py#L450)）是系统心跳：`select_operator_to_run()` 挑一个"有输入+有资源"的算子 → `dispatch_next_task()`。对 Map 算子逐块提交；对 AllToAll，输入未齐时不动，齐了才 `_bulk_fn` 放水。这就是"边执行边调度、流式喂下游"的精确含义——但 AllToAll 是水闸。
